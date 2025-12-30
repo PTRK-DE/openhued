@@ -20,11 +20,12 @@ import (
 )
 
 type Daemon struct {
-	home   *openhue.Home
-	cfg    *config.Config
-	mu     sync.Mutex
-	light  *openhue.GroupedLightGet
-	socket string
+	home                *openhue.Home
+	cfg                 *config.Config
+	mu                  sync.Mutex
+	light               *openhue.GroupedLightGet
+	socket              string
+	lastKnownBrightness float32
 }
 
 // NewDaemon connects to the bridge and loads initial state.
@@ -40,11 +41,17 @@ func NewDaemon(cfg *config.Config, socketPath string) (*Daemon, error) {
 		return nil, fmt.Errorf("get grouped light: %w", err)
 	}
 
+	lastBrightness := float32(100)
+	if gl != nil && gl.Dimming != nil && gl.Dimming.Brightness != nil && *gl.Dimming.Brightness > 0 {
+		lastBrightness = *gl.Dimming.Brightness
+	}
+
 	d := &Daemon{
-		home:   home,
-		cfg:    cfg,
-		light:  gl,
-		socket: socketPath,
+		home:                home,
+		cfg:                 cfg,
+		light:               gl,
+		socket:              socketPath,
+		lastKnownBrightness: lastBrightness,
 	}
 
 	// Start the event stream to receive updates
@@ -99,15 +106,49 @@ func (d *Daemon) currentBrightnessPercent() int {
 		return 0
 	}
 
+	if d.light.Dimming != nil && d.light.Dimming.Brightness != nil {
+		if v := float32(*d.light.Dimming.Brightness); v > 0 {
+			d.rememberBrightnessLocked(v)
+		}
+	}
+
 	if !d.light.IsOn() {
 		return 0
 	}
 
 	if d.light.Dimming != nil && d.light.Dimming.Brightness != nil {
-		return int(*d.light.Dimming.Brightness)
+		if v := float32(*d.light.Dimming.Brightness); v > 0 {
+			return int(v)
+		}
+	}
+
+	if d.lastKnownBrightness > 0 {
+		return int(d.lastKnownBrightness)
 	}
 
 	return 100
+}
+
+func (d *Daemon) rememberBrightnessLocked(v float32) {
+	if v > 0 {
+		d.lastKnownBrightness = v
+	}
+}
+
+func (d *Daemon) ensureBrightnessCachedLocked() {
+	if d.light == nil || !d.light.IsOn() {
+		return
+	}
+	if d.lastKnownBrightness <= 0 {
+		return
+	}
+	if d.light.Dimming == nil {
+		d.light.Dimming = &openhue.Dimming{}
+	}
+	if d.light.Dimming.Brightness == nil || *d.light.Dimming.Brightness <= 0 {
+		nb := openhue.Brightness(d.lastKnownBrightness)
+		d.light.Dimming.Brightness = &nb
+	}
 }
 
 func (d *Daemon) printBrightness() {
@@ -160,22 +201,41 @@ func (d *Daemon) toggle() (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	if d.light.IsOn() && d.light.Dimming != nil && d.light.Dimming.Brightness != nil {
+		d.rememberBrightnessLocked(float32(*d.light.Dimming.Brightness))
+	}
+
+	targetOn := d.light.Toggle()
+	body := openhue.GroupedLightPut{On: targetOn}
+	restoringBrightness := targetOn != nil && targetOn.On != nil && *targetOn.On && d.lastKnownBrightness > 0
+
+	if restoringBrightness {
+		nb := openhue.Brightness(d.lastKnownBrightness)
+		body.Dimming = &openhue.Dimming{Brightness: &nb}
+	}
+
 	// Send toggle command to bridge
-	if err := d.home.UpdateGroupedLight(*d.light.Id, openhue.GroupedLightPut{
-		On: d.light.Toggle(),
-	}); err != nil {
+	if err := d.home.UpdateGroupedLight(*d.light.Id, body); err != nil {
 		return "", fmt.Errorf("toggle light: %w", err)
 	}
 
 	// Optimistically update local state
-	if d.light.On != nil && d.light.On.On != nil {
-		newState := !(*d.light.On.On)
-		d.light.On.On = &newState
+	if d.light.On == nil {
+		d.light.On = &openhue.On{}
+	}
+	d.light.On.On = targetOn.On
+	if restoringBrightness {
+		if d.light.Dimming == nil {
+			d.light.Dimming = &openhue.Dimming{}
+		}
+		nb := openhue.Brightness(d.lastKnownBrightness)
+		d.light.Dimming.Brightness = &nb
 	}
 
 	state := "off"
 	if d.light.IsOn() {
 		state = "on"
+		d.ensureBrightnessCachedLocked()
 	}
 
 	d.printBrightness()
@@ -187,9 +247,14 @@ func (d *Daemon) adjustBrightness(direction string) (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	cur := float32(100)
-	if d.light.Dimming != nil && d.light.Dimming.Brightness != nil {
-		cur = *d.light.Dimming.Brightness
+	cur := d.lastKnownBrightness
+	if cur <= 0 {
+		if d.light.Dimming != nil && d.light.Dimming.Brightness != nil && *d.light.Dimming.Brightness > 0 {
+			cur = *d.light.Dimming.Brightness
+			d.rememberBrightnessLocked(cur)
+		} else {
+			cur = float32(100)
+		}
 	}
 
 	if !d.light.IsOn() {
@@ -224,6 +289,7 @@ func (d *Daemon) adjustBrightness(direction string) (string, error) {
 		d.light.Dimming = &openhue.Dimming{}
 	}
 	d.light.Dimming.Brightness = &nb
+	d.rememberBrightnessLocked(cur)
 
 	d.printBrightness()
 	return fmt.Sprintf("ok: brightness %s to %d%%\n", direction, int(cur+0.5)), nil
@@ -294,6 +360,10 @@ func (d *Daemon) consumeEventStream(client *http.Client, url, apiKey, lastEventI
 	}
 
 	fmt.Println("Connected to Hue event stream")
+
+	d.mu.Lock()
+	d.printBrightness()
+	d.mu.Unlock()
 
 	reader := bufio.NewReader(resp.Body)
 	var dataLines []string
@@ -373,6 +443,7 @@ func (d *Daemon) handleEventBatch(events []map[string]interface{}) {
 					}
 					nb := openhue.Brightness(float32(b))
 					d.light.Dimming.Brightness = &nb
+					d.rememberBrightnessLocked(float32(b))
 				}
 			}
 
