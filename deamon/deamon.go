@@ -26,6 +26,9 @@ type Daemon struct {
 	light               *openhue.GroupedLightGet
 	socket              string
 	lastKnownBrightness float32
+	debounceDelay       time.Duration
+	debounceTimer       *time.Timer
+	pendingBrightness   *float32
 }
 
 // NewDaemon connects to the bridge and loads initial state.
@@ -52,6 +55,7 @@ func NewDaemon(cfg *config.Config, socketPath string) (*Daemon, error) {
 		light:               gl,
 		socket:              socketPath,
 		lastKnownBrightness: lastBrightness,
+		debounceDelay:       time.Duration(cfg.CommandDebounceMs) * time.Millisecond,
 	}
 
 	// Start the event stream to receive updates
@@ -201,6 +205,11 @@ func (d *Daemon) toggle() (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	if d.debounceTimer != nil {
+		d.debounceTimer.Stop()
+	}
+	d.pendingBrightness = nil
+
 	if d.light.IsOn() && d.light.Dimming != nil && d.light.Dimming.Brightness != nil {
 		d.rememberBrightnessLocked(float32(*d.light.Dimming.Brightness))
 	}
@@ -278,21 +287,47 @@ func (d *Daemon) adjustBrightness(direction string) (string, error) {
 	}
 
 	nb := openhue.Brightness(cur)
-
-	if err := d.home.UpdateGroupedLight(*d.light.Id, openhue.GroupedLightPut{
-		Dimming: &openhue.Dimming{Brightness: &nb},
-	}); err != nil {
-		return "", fmt.Errorf("adjust brightness: %w", err)
-	}
-
 	if d.light.Dimming == nil {
 		d.light.Dimming = &openhue.Dimming{}
 	}
 	d.light.Dimming.Brightness = &nb
 	d.rememberBrightnessLocked(cur)
 
+	d.queueBrightnessUpdateLocked(cur)
 	d.printBrightness()
 	return fmt.Sprintf("ok: brightness %s to %d%%\n", direction, int(cur+0.5)), nil
+}
+
+func (d *Daemon) queueBrightnessUpdateLocked(target float32) {
+	d.pendingBrightness = &target
+	if d.debounceDelay <= 0 {
+		go d.flushPendingBrightness()
+		return
+	}
+	if d.debounceTimer == nil {
+		d.debounceTimer = time.AfterFunc(d.debounceDelay, d.flushPendingBrightness)
+		return
+	}
+	d.debounceTimer.Reset(d.debounceDelay)
+}
+
+func (d *Daemon) flushPendingBrightness() {
+	d.mu.Lock()
+	if d.pendingBrightness == nil || d.light == nil || d.light.Id == nil {
+		d.mu.Unlock()
+		return
+	}
+	target := *d.pendingBrightness
+	d.pendingBrightness = nil
+	lightID := *d.light.Id
+	d.mu.Unlock()
+
+	nb := openhue.Brightness(target)
+	if err := d.home.UpdateGroupedLight(lightID, openhue.GroupedLightPut{
+		Dimming: &openhue.Dimming{Brightness: &nb},
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "adjust brightness (debounced): %v\n", err)
+	}
 }
 
 // Optional: keep your lock-file helper if you still want mutual exclusion

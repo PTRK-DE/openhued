@@ -19,7 +19,8 @@ Minimal Unix-socket Hue daemon plus CLI helper built on `github.com/openhue/open
 {
   "light_id": "your-grouped-light-id",
   "brightness_increment": 5,
-  "stream_brightness": false
+  "stream_brightness": false,
+  "command_debounce_ms": 500
 }
 ```
 
@@ -27,6 +28,7 @@ Fields:
 - `light_id` (required): grouped light identifier to control.
 - `brightness_increment` (optional): brightness step in percent for `up/down` commands (defaults to 5; clamped 0–100).
 - `stream_brightness` (optional): when true the daemon prints the current brightness to stdout after each command, useful for status bars like Waybar (defaults to false).
+- `command_debounce_ms` (optional): debounce window in milliseconds for `up/down` commands; changes within the window are coalesced into one bridge request (defaults to 500).
 
 ## Run
 1) Start the daemon (single terminal):

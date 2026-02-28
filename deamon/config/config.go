@@ -12,6 +12,7 @@ type Config struct {
 	LightID             string `json:"light_id"`
 	BrightnessIncrement int    `json:"brightness_increment"`
 	StreamBrightness    bool   `json:"stream_brightness"`
+	CommandDebounceMs   int    `json:"command_debounce_ms"`
 }
 
 func DefaultPath() (string, error) {
@@ -46,6 +47,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.BrightnessIncrement <= 0 {
 		cfg.BrightnessIncrement = 5
+	}
+	if cfg.CommandDebounceMs <= 0 {
+		cfg.CommandDebounceMs = 500
 	}
 
 	return &cfg, nil
